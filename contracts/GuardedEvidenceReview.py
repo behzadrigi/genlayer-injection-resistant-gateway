@@ -38,10 +38,9 @@ def first_label(text: str, labels: tuple, default: str) -> str:
 
 
 def judge_claim_guarded(claim: str, source_url: str) -> str:
-    """Fetches the source fresh (independent of SourceIntegrityScanner's own
-    fetch) and judges it with the fetched content structurally isolated and
-    explicitly labeled as untrusted data, never as instructions — defense in
-    depth on top of the upstream safety scan, not a replacement for it."""
+    # Fetches the source fresh (independent of the scanner's own fetch) and
+    # judges it with the fetched content isolated and labeled as untrusted
+    # data, never as instructions. Defense in depth on top of the safety scan.
     try:
         content = gl.nondet.web.render(source_url, mode='text')
     except:
@@ -124,7 +123,7 @@ class GuardedEvidenceReview(gl.Contract):
             Address(self.scanner_contract)
         ).view().get_scan_status(c.source_url)
         assert scan_status != "NOT_SCANNED", "Source has not been integrity-scanned yet"
-        assert scan_status == "SAFE", "Source failed the integrity scan — cannot use as evidence"
+        assert scan_status == "SAFE", "Source failed the integrity scan - cannot use as evidence"
 
         claim_text = c.claim
         source_url = c.source_url
