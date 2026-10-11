@@ -2,6 +2,7 @@
 
 import json
 import re
+import hashlib
 
 from genlayer import *
 from dataclasses import dataclass
@@ -16,8 +17,10 @@ def clean_url(url: str):
     if cleaned.startswith('http://'):
         cleaned = cleaned.replace('http://', 'https://', 1)
     cleaned = cleaned.replace(' ', '')
-    if '?' in cleaned:
-        cleaned = cleaned.split('?')[0]
+    # NOTE: query strings are now preserved. Previously stripping the '?'
+    # suffix collapsed distinct resources (page?id=1 and page?id=2) into the
+    # same scan record, which the steward flagged. The URL is left as-is
+    # (only trimmed and lowercased for the host part by the caller).
     return cleaned if cleaned else None
 
 
@@ -37,11 +40,20 @@ def first_label(text: str, labels: tuple, default: str) -> str:
     return default
 
 
-def detect_injection(source_url: str) -> str:
-    # Fetches a page and asks a narrowly-scoped detection question: does this
-    # content try to instruct or manipulate an AI system reading it? This is a
-    # classification task about the page text, not a judgment about any claim,
-    # kept separate from the evidence-judging prompt in GuardedEvidenceReview.
+def content_digest(content: str) -> str:
+    """Stable fingerprint of the exact bytes judged. Uses SHA-256 over the
+    rendered text (truncated the same way both at scan time and at review
+    time), so the scan record is bound to a specific content revision and
+    cannot be silently re-used after the page has changed."""
+    return hashlib.sha256(str(content).encode("utf-8")).hexdigest()
+
+
+def fetch_and_digest(source_url: str) -> dict:
+    """Fetches the page once and returns both the verdict and the digest of
+    the exact content that was used to produce it. Called inside both
+    leader_fn and validator_fn so that every independent validator computes
+    the digest over its own fetch — the digest is part of the consensus,
+    not something computed once by the leader and trusted by everyone else."""
     try:
         content = gl.nondet.web.render(source_url, mode='text')
     except:
@@ -49,7 +61,10 @@ def detect_injection(source_url: str) -> str:
 
     if content.strip() == "":
         # A page that cannot be read at all is not certifiable as safe.
-        return "SUSPICIOUS"
+        return {
+            "verdict": "SUSPICIOUS",
+            "content_hash": "",
+        }
 
     prompt = f"""
     You are a security classifier, not a general assistant. You are shown
@@ -70,7 +85,11 @@ def detect_injection(source_url: str) -> str:
     SUSPICIOUS (such an attempt is present).
     """
     response = gl.nondet.exec_prompt(prompt)
-    return first_label(response, VERDICTS, "SUSPICIOUS")
+    verdict = first_label(response, VERDICTS, "SUSPICIOUS")
+    return {
+        "verdict": verdict,
+        "content_hash": content_digest(content),
+    }
 
 
 @allow_storage
@@ -78,8 +97,9 @@ def detect_injection(source_url: str) -> str:
 class ScanRecord:
     source_url: str
     requester: str
-    verdict: str  # SAFE, SUSPICIOUS
-    status: str  # SCANNED
+    verdict: str          # SAFE, SUSPICIOUS
+    content_hash: str     # sha256 of the exact content that produced verdict
+    status: str           # SCANNED
 
 
 class SourceIntegrityScanner(gl.Contract):
@@ -99,17 +119,28 @@ class SourceIntegrityScanner(gl.Contract):
 
         requester = str(gl.message.sender_address)
 
-        # Equivalence Principle: STRICT EQUALITY on a two-way verdict.
+        # Equivalence Principle: STRICT EQUALITY on both the verdict AND the
+        # content digest. The digest binds the verdict to a specific revision
+        # of the page — if the page changes later, the record no longer
+        # applies and a downstream review will reject the claim.
         def leader_fn():
-            return {"verdict": detect_injection(cleaned)}
+            return fetch_and_digest(cleaned)
 
         def validator_fn(leader_result):
             if not isinstance(leader_result, gl.vm.Return):
                 return False
-            leader_verdict = leader_result.calldata.get("verdict")
+            leader_data = leader_result.calldata
+            leader_verdict = leader_data.get("verdict")
+            leader_hash = leader_data.get("content_hash")
             if leader_verdict not in VERDICTS:
                 return False
-            return detect_injection(cleaned) == leader_verdict
+            if not isinstance(leader_hash, str):
+                return False
+            mine = fetch_and_digest(cleaned)
+            return (
+                mine["verdict"] == leader_verdict
+                and mine["content_hash"] == leader_hash
+            )
 
         result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
 
@@ -117,6 +148,7 @@ class SourceIntegrityScanner(gl.Contract):
             source_url=cleaned,
             requester=requester,
             verdict=result["verdict"],
+            content_hash=result["content_hash"],
             status="SCANNED",
         )
         self.url_log[self.next_id] = cleaned
@@ -140,6 +172,7 @@ class SourceIntegrityScanner(gl.Contract):
             "source_url": s.source_url,
             "requester": s.requester,
             "verdict": s.verdict,
+            "content_hash": s.content_hash,
             "status": s.status,
         })
 
