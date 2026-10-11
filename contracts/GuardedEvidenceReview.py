@@ -2,6 +2,7 @@
 
 import json
 import re
+import hashlib
 
 from genlayer import *
 from dataclasses import dataclass
@@ -16,8 +17,7 @@ def clean_url(url: str):
     if cleaned.startswith('http://'):
         cleaned = cleaned.replace('http://', 'https://', 1)
     cleaned = cleaned.replace(' ', '')
-    if '?' in cleaned:
-        cleaned = cleaned.split('?')[0]
+    # NOTE: query string is preserved (see SourceIntegrityScanner.clean_url).
     return cleaned if cleaned else None
 
 
@@ -37,17 +37,38 @@ def first_label(text: str, labels: tuple, default: str) -> str:
     return default
 
 
-def judge_claim_guarded(claim: str, source_url: str) -> str:
-    # Fetches the source fresh (independent of the scanner's own fetch) and
-    # judges it with the fetched content isolated and labeled as untrusted
-    # data, never as instructions. Defense in depth on top of the safety scan.
+def content_digest(content: str) -> str:
+    return hashlib.sha256(str(content).encode("utf-8")).hexdigest()
+
+
+def judge_claim_bound(claim: str, source_url: str, expected_hash: str) -> dict:
+    """Fetches the source fresh, verifies the content digest matches the one
+    that the scanner recorded at scan time, and only then judges the claim.
+    If the page has changed since it was scanned, the digest will not match
+    and the review is refused instead of being carried out under the old
+    SAFE record.
+
+    Called independently in both leader_fn and validator_fn, so every
+    validator performs its own fetch and its own digest check."""
     try:
         content = gl.nondet.web.render(source_url, mode='text')
     except:
         content = ""
 
     if content.strip() == "":
-        return "UNSUPPORTED"
+        return {
+            "content_hash_matches": False,
+            "verdict": "UNSUPPORTED",
+        }
+
+    actual_hash = content_digest(content)
+    if actual_hash != expected_hash:
+        # The page is not the same content that was scanned and approved.
+        # Refuse to judge under the stale SAFE record.
+        return {
+            "content_hash_matches": False,
+            "verdict": "UNSUPPORTED",
+        }
 
     prompt = f"""
     You are evaluating whether UNTRUSTED_CONTENT below supports a CLAIM.
@@ -69,7 +90,10 @@ def judge_claim_guarded(claim: str, source_url: str) -> str:
     Respond with ONLY one word: SUPPORTED or UNSUPPORTED.
     """
     response = gl.nondet.exec_prompt(prompt)
-    return first_label(response, VERDICTS, "UNSUPPORTED")
+    return {
+        "content_hash_matches": True,
+        "verdict": first_label(response, VERDICTS, "UNSUPPORTED"),
+    }
 
 
 @allow_storage
@@ -79,8 +103,9 @@ class ClaimRecord:
     agent: str
     claim: str
     source_url: str
+    source_hash: str      # the digest the scanner recorded for this source
     verdict: str
-    status: str  # PENDING, REVIEWED
+    status: str           # PENDING, REVIEWED
 
 
 class GuardedEvidenceReview(gl.Contract):
@@ -101,6 +126,23 @@ class GuardedEvidenceReview(gl.Contract):
         assert cleaned is not None, f"Invalid source URL: {source_url}"
         assert is_valid_url(cleaned), f"Invalid source URL: {cleaned}"
 
+        # Bind the claim to the exact scan record at submission time.
+        scan_raw = gl.get_contract_at(
+            Address(self.scanner_contract)
+        ).view().get_scan_data(cleaned)
+        assert scan_raw != "NOT_FOUND", "Source has not been integrity-scanned yet"
+
+        try:
+            scan_data = json.loads(scan_raw)
+        except:
+            raise gl.vm.UserError("Invalid data from scanner")
+
+        assert scan_data.get("verdict", "") == "SAFE", \
+            "Source failed the integrity scan - cannot use as evidence"
+
+        recorded_hash = scan_data.get("content_hash", "")
+        assert recorded_hash != "", "Scan record is missing a content hash"
+
         cid = self.next_id
         self.next_id += u256(1)
         self.claims[cid] = ClaimRecord(
@@ -108,6 +150,7 @@ class GuardedEvidenceReview(gl.Contract):
             agent=agent,
             claim=claim,
             source_url=cleaned,
+            source_hash=recorded_hash,
             verdict="",
             status="PENDING",
         )
@@ -119,6 +162,8 @@ class GuardedEvidenceReview(gl.Contract):
         c = self.claims[claim_id]
         assert c.status == "PENDING", "Already reviewed"
 
+        # Re-check that the scan record is still SAFE (defensive; the
+        # authoritative check is the content hash comparison below).
         scan_status = gl.get_contract_at(
             Address(self.scanner_contract)
         ).view().get_scan_status(c.source_url)
@@ -127,20 +172,36 @@ class GuardedEvidenceReview(gl.Contract):
 
         claim_text = c.claim
         source_url = c.source_url
+        expected_hash = c.source_hash
 
-        # Equivalence Principle: STRICT EQUALITY on a two-way verdict.
+        # Equivalence Principle: STRICT EQUALITY on BOTH the content-hash
+        # match flag and the verdict. Every validator independently fetches
+        # the source, recomputes the digest, and compares it with the hash
+        # that was bound to this claim at submission time. If the page has
+        # changed since the scan, every validator will see
+        # content_hash_matches=False and the transaction is rejected below.
         def leader_fn():
-            return {"verdict": judge_claim_guarded(claim_text, source_url)}
+            return judge_claim_bound(claim_text, source_url, expected_hash)
 
         def validator_fn(leader_result):
             if not isinstance(leader_result, gl.vm.Return):
                 return False
-            leader_verdict = leader_result.calldata.get("verdict")
+            leader_data = leader_result.calldata
+            if not isinstance(leader_data.get("content_hash_matches"), bool):
+                return False
+            leader_verdict = leader_data.get("verdict")
             if leader_verdict not in VERDICTS:
                 return False
-            return judge_claim_guarded(claim_text, source_url) == leader_verdict
+            mine = judge_claim_bound(claim_text, source_url, expected_hash)
+            return (
+                mine["content_hash_matches"] == leader_data["content_hash_matches"]
+                and mine["verdict"] == leader_verdict
+            )
 
         result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+
+        assert result["content_hash_matches"], \
+            "Source content changed since scan - cannot review under stale scan"
 
         c.verdict = result["verdict"]
         c.status = "REVIEWED"
@@ -163,6 +224,7 @@ class GuardedEvidenceReview(gl.Contract):
             "agent": c.agent,
             "claim": c.claim,
             "source_url": c.source_url,
+            "source_hash": c.source_hash,
             "verdict": c.verdict,
             "status": c.status,
         })
