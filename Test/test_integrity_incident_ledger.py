@@ -1,46 +1,16 @@
-import json
-import pytest
-from genlayer_py import create_client, create_account
-from genlayer_py.chains import localnet
+# Tests: IntegrityIncidentLedger
 
-CONTRACT_ADDRESS = "0xD883AB591d2cd208122C28402530dB9D12375535"  # Studio
-GOOD = "https://www.python.org/about"
-UNSCANNED = "https://www.nasa.gov"
-POISON = "https://gist.githubusercontent.com/behzadrigi/5dc494f79b96ae16c4abbfa7f0fc13a1/raw/8d403823159b3e91a307b6727e213d9918604bb2/poison.txt"
+| Network | Address | Scanner it reads |
+|---|---|---|
+| Studionet | `0x950b551B18B31a79F3B4b3fDB89e2E7f2509a91D` | `0xc3D1e6967c71e647Cb3dA6465293c0FaE3D31931` |
+| Bradbury | `0xF98F693eFe5Ccbc5885BBa3dBc23Dcde20e291d6` | `0x08101A9c188dB1737E231C25b5E641df92A3A3fD` |
 
+Status legend: **RUN** has transaction evidence in [TEST.md](../TEST.md) (S = Studio). **DEFINED** is a ready test case that has not been run on these deployments.
 
-@pytest.fixture(scope="module")
-def client():
-    return create_client(chain=localnet, account=create_account())
-
-
-def _write(client, fn, args):
-    tx = client.write_contract(address=CONTRACT_ADDRESS, function_name=fn, args=args, value=0)
-    return client.wait_for_transaction_receipt(transaction_hash=tx, status="ACCEPTED")
-
-
-def _read(client, fn, args=None):
-    return client.read_contract(address=CONTRACT_ADDRESS, function_name=fn, args=args or [])
-
-
-def test_unscanned_source_cannot_be_logged(client):
-    with pytest.raises(Exception, match="Source has not been scanned yet"):
-        _write(client, "record_incident", [UNSCANNED])
-
-
-def test_safe_source_cannot_be_logged(client):
-    with pytest.raises(Exception, match="Only SUSPICIOUS sources can be logged as incidents"):
-        _write(client, "record_incident", [GOOD])
-
-
-def test_poisoned_source_is_logged_once(client):
-    try:
-        _write(client, "record_incident", [POISON])
-    except Exception as e:
-        assert "Already logged" in str(e)
-    data = json.loads(_read(client, "get_incident_data", [0]))
-    assert data["status"] == "LOGGED"
-    assert data["scan_requester"] != "" and data["reported_by"] != ""
-    assert POISON.split("/")[2] in _read(client, "list_incidents")
-    with pytest.raises(Exception, match="Already logged"):
-        _write(client, "record_incident", [POISON])
+| ID | Case | Steps | Expected | Status |
+|---|---|---|---|---|
+| LG-1 | A SUSPICIOUS source is logged | `record_incident(URL_B)` | Incident id 0, `status = LOGGED` | RUN (S8) |
+| LG-2 | An incident is logged once | `record_incident(URL_B)` again | Rejected: `Already logged` | RUN (S8) |
+| LG-3 | A SAFE source cannot be logged | `record_incident(URL_A_V2)` | Rejected: `Only SUSPICIOUS sources can be logged as incidents` | DEFINED |
+| LG-4 | An unscanned source cannot be logged | `record_incident("https://example.com/never-scanned")` | Rejected: `Source has not been scanned yet` | DEFINED |
+| LG-5 | Incident data | `get_incident_data(0)` | `source_url` is URL_B, `scan_requester` is the scanning account, `reported_by` is the caller | DEFINED |
