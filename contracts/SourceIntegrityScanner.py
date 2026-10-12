@@ -17,10 +17,8 @@ def clean_url(url: str):
     if cleaned.startswith('http://'):
         cleaned = cleaned.replace('http://', 'https://', 1)
     cleaned = cleaned.replace(' ', '')
-    # NOTE: query strings are now preserved. Previously stripping the '?'
-    # suffix collapsed distinct resources (page?id=1 and page?id=2) into the
-    # same scan record, which the steward flagged. The URL is left as-is
-    # (only trimmed and lowercased for the host part by the caller).
+    # NOTE: query strings are preserved so that distinct resources
+    # (page?id=1 and page?id=2) get distinct scan records.
     return cleaned if cleaned else None
 
 
@@ -41,10 +39,9 @@ def first_label(text: str, labels: tuple, default: str) -> str:
 
 
 def content_digest(content: str) -> str:
-    """Stable fingerprint of the exact bytes judged. Uses SHA-256 over the
-    rendered text (truncated the same way both at scan time and at review
-    time), so the scan record is bound to a specific content revision and
-    cannot be silently re-used after the page has changed."""
+    """SHA-256 of the full rendered text. Any change anywhere in the page
+    changes the digest, so a scan record is bound to one content revision
+    and cannot be re-used after the page has changed."""
     return hashlib.sha256(str(content).encode("utf-8")).hexdigest()
 
 
@@ -52,7 +49,7 @@ def fetch_and_digest(source_url: str) -> dict:
     """Fetches the page once and returns both the verdict and the digest of
     the exact content that was used to produce it. Called inside both
     leader_fn and validator_fn so that every independent validator computes
-    the digest over its own fetch — the digest is part of the consensus,
+    the digest over its own fetch - the digest is part of the consensus,
     not something computed once by the leader and trusted by everyone else."""
     try:
         content = gl.nondet.web.render(source_url, mode='text')
@@ -121,7 +118,7 @@ class SourceIntegrityScanner(gl.Contract):
 
         # Equivalence Principle: STRICT EQUALITY on both the verdict AND the
         # content digest. The digest binds the verdict to a specific revision
-        # of the page — if the page changes later, the record no longer
+        # of the page - if the page changes later, the record no longer
         # applies and a downstream review will reject the claim.
         def leader_fn():
             return fetch_and_digest(cleaned)
