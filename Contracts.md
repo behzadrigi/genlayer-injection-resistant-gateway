@@ -1,75 +1,89 @@
-# Contracts
+# Contract reference
 
-## 1. SourceIntegrityScanner
+All four contracts are pure ASCII Python for the GenLayer runtime, use `gl.nondet.web.render(url, mode='text')` and the `gl.vm.run_nondet_unsafe` leader/validator pattern, and handle no funds.
 
-**Pattern:** non-deterministic, Equivalence Principle consensus with strict
-equality on a two-way label (`SAFE` or `SUSPICIOUS`).
+## Shared URL rules
 
-**Purpose:** fetches a URL with `gl.nondet.web.render(url, mode='text')` and
-asks one narrow question: does this text try to instruct or manipulate a
-language model that reads it? It does not judge any claim.
+Every contract that accepts a URL canonicalizes it the same way:
 
-**Public methods:** `scan_source`, `get_scan_status`, `get_scan_data`,
-`list_scans`.
+- surrounding whitespace is removed and a trailing `/` is trimmed
+- `http://` is upgraded to `https://`
+- spaces inside the URL are removed
+- the query string is **kept** (this is the fix for distinct resources sharing one record)
+- the result must match `https?://` + a dotted host + an optional path made of letters, digits, `_ - . / ? % & =`; anything else, including fragments, is rejected rather than merged with another URL
 
-**Safety properties**
-- A URL can be scanned only once (`Already scanned`). The key is the
-  normalized URL (http upgraded to https, trailing slash and query string
-  removed).
-- A page that returns no readable text is classified SUSPICIOUS, never SAFE.
-- Validators each fetch and classify the page themselves and must reach the
-  exact same label.
-- `get_scan_status` returns `NOT_SCANNED` for unknown URLs, so downstream
-  contracts can tell "never scanned" apart from "scanned and safe".
+## SourceIntegrityScanner
 
-## 2. GuardedEvidenceReview
+Classifies a page and records exactly which content produced the verdict.
 
-**Pattern:** non-deterministic, strict equality on `SUPPORTED` or
-`UNSUPPORTED`.
+**Storage**
 
-**Purpose:** judges whether a source supports a claim, but only after the
-source passed the scanner.
+| Field | Meaning |
+|---|---|
+| `scans: TreeMap[str, ScanRecord]` | one record per canonical URL |
+| `url_log: TreeMap[u256, str]` | insertion order for listing |
 
-**Public methods:** `submit_claim`, `review_claim`, `get_claim_status`,
-`get_claim_data`, `list_claims`.
+`ScanRecord`: `source_url`, `requester`, `verdict` (SAFE or SUSPICIOUS), `content_hash` (SHA-256 hex of the rendered page text, empty when the page was unreadable), `status` (SCANNED).
 
-**Safety properties**
-- `agent` is `gl.message.sender_address`, never a parameter.
-- `review_claim` reads the scan result from `SourceIntegrityScanner` on-chain.
-  It reverts with `Source has not been integrity-scanned yet` for an unscanned
-  source and with `Source failed the integrity scan` for a SUSPICIOUS one. The
-  model is never asked to judge a source that failed the scan.
-- The page is fetched again at review time and passed to the model inside a
-  block labeled as untrusted data.
-- A claim can be reviewed once. The record is written only after consensus
-  succeeds.
+**Methods**
 
-## 3. CrossSourceCorroboration
+| Method | Type | Behavior |
+|---|---|---|
+| `scan_source(source_url)` | write | Validates the URL, refuses a URL that already has a record (`Already scanned`), fetches the page, classifies the first 3000 characters, hashes the full text |
+| `get_scan_status(source_url)` | view | `SAFE`, `SUSPICIOUS` or `NOT_SCANNED` |
+| `get_scan_data(source_url)` | view | JSON with `source_url`, `requester`, `verdict`, `content_hash`, `status`, or `NOT_FOUND` |
+| `list_scans()` | view | `url:verdict` pairs |
 
-**Pattern:** fully deterministic. It adds no model calls of its own.
+**Consensus.** Strict equality on `verdict` and `content_hash`. Both are computed inside the leader and inside every validator from that node's own fetch.
 
-**Purpose:** combines two reviewed claims into one corroboration result.
+**Fail-closed rules.** An unreadable or empty page is SUSPICIOUS with an empty hash. A response that is not a clear label defaults to SUSPICIOUS.
 
-**Public methods:** `corroborate`, `get_corroboration_data`,
-`list_corroborations`.
+## GuardedEvidenceReview
 
-**Safety properties**
-- Both claims are read from `GuardedEvidenceReview`'s state.
-- Both must be `REVIEWED`, must have the exact same claim text, and must come
-  from different domains.
-- The status is `CORROBORATED` only if both verdicts are `SUPPORTED`.
-- A pair of claim ids can be corroborated once, in either order.
+Judges a claim only against the exact content that was scanned SAFE.
 
-## 4. IntegrityIncidentLedger
+**Storage.** `claims: TreeMap[u256, ClaimRecord]`, `next_id`, `scanner_contract`.
 
-**Pattern:** fully deterministic.
+`ClaimRecord`: `claim_id`, `agent`, `claim`, `source_url`, `source_hash` (the scanner digest bound at submission), `verdict`, `status` (PENDING or REVIEWED).
 
-**Purpose:** a permanent public record of sources the scanner flagged.
+**Methods**
 
-**Public methods:** `record_incident`, `get_incident_data`, `list_incidents`.
+| Method | Type | Behavior |
+|---|---|---|
+| `submit_claim(claim, source_url)` | write | Requires a scan record with verdict SAFE and a non-empty hash; stores the hash in the claim. Errors: `Source has not been integrity-scanned yet`, `Source failed the integrity scan - cannot use as evidence`, `Scan record is missing a content hash` |
+| `review_claim(claim_id)` | write | Re-checks the scan status, then every validator re-fetches the page, recomputes the digest, compares it with `source_hash`, and only on a match judges the claim as SUPPORTED or UNSUPPORTED. Errors: `Claim not found`, `Already reviewed`, `Source content changed since scan - cannot review under stale scan` |
+| `get_claim_status(claim_id)` | view | PENDING, REVIEWED or NOT_FOUND |
+| `get_claim_data(claim_id)` | view | JSON of the claim including `source_hash` and `verdict` |
+| `list_claims()` | view | `id:status` pairs |
 
-**Safety properties**
-- The verdict is read from the scanner's own state. A source that was never
-  scanned, or that scanned SAFE, cannot be logged.
-- A URL can be logged once.
-- The record keeps both the original scan requester and the reporter.
+**Consensus.** Strict equality on `content_hash_matches` and `verdict`. A page that differs from the bound digest makes every validator return `content_hash_matches = false`, and the transaction is rejected, so the claim stays PENDING.
+
+**Prompt hygiene.** The fetched text is wrapped as untrusted data and the first 2500 characters are used. That window is inside the 3000 characters the scanner classified.
+
+## CrossSourceCorroboration
+
+Corroborates one statement across two reviewed claims.
+
+**Methods**
+
+| Method | Type | Behavior |
+|---|---|---|
+| `corroborate(claim_id_a, claim_id_b)` | write | Requires two distinct claims, both REVIEWED, with identical claim text and sources on different domains (after removing `www.`); the pair can be used once. Status is CORROBORATED when both verdicts are SUPPORTED, otherwise NOT_CORROBORATED |
+| `get_corroboration_data(id)` | view | JSON with both claim ids, both domains and the status |
+| `list_corroborations()` | view | `id:status` pairs |
+
+Errors: `Must provide two distinct claim ids`, `This pair has already been corroborated`, `Claim A not found`, `Claim B not found`, `Claim A has not been reviewed yet`, `Claim B has not been reviewed yet`, `Could not determine source domains`, `Sources must come from independent domains`.
+
+Content binding is enforced upstream: a claim can only be REVIEWED if its page matched the scanned digest, so this contract does not repeat the check.
+
+## IntegrityIncidentLedger
+
+Deterministic record of sources that failed the scan. It never calls a model.
+
+**Methods**
+
+| Method | Type | Behavior |
+|---|---|---|
+| `record_incident(source_url)` | write | Reads the scan record; only a SUSPICIOUS source can be logged, once. Errors: `Source has not been scanned yet`, `Only SUSPICIOUS sources can be logged as incidents`, `Already logged` |
+| `get_incident_data(incident_id)` | view | JSON with `source_url`, `scan_requester`, `reported_by`, `status` |
+| `list_incidents()` | view | incident listing |
